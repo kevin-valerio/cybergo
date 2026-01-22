@@ -8,17 +8,32 @@ cybergo contains:
 This repo adds a glue path so a user can keep writing **standard Go fuzz tests** (the ones used by `go test -fuzz=...`) and switch engines with a flag:
 
 ```bash
-go test -fuzz=FuzzXxx --use-libafl
+go test -fuzz=FuzzXxx --use-libafl --focus-on-new-code=false
 ```
 
 Without the flag, `go test -fuzz` behaves like upstream Go.
+
+## Git-aware scheduling (focus on new code)
+
+When `--use-libafl` is set, `--focus-on-new-code={true|false}` is **required**.
+
+- `--focus-on-new-code=false`: keep the current behavior.
+- `--focus-on-new-code=true`: prefer inputs that execute recently changed lines (based on `git blame`).
+
+Note: `--focus-on-new-code=true` needs `git` (to run `git blame`) and an `addr2line` implementation to map coverage counters back to source `file:line` (prefer `llvm-addr2line`; fall back to binutils `addr2line`).
+
+Implementation note: the git-aware scheduler currently comes from a local LibAFL fork (TODO: switch back to upstream LibAFL once upstreamed).
+
+### Benchmark (geth)
+
+A paired benchmark for `--focus-on-new-code` on a shallow clone of go-ethereum (geth) lives at `misc/cybergo/bench_focus_on_new_code_geth.sh`.
 
 ## Runner configuration
 
 cybergo can pass a JSONC configuration file (JSON with `//` comments) to the LibAFL runner:
 
 ```bash
-go test -fuzz=FuzzXxx --use-libafl --libafl-config=libafl.jsonc
+go test -fuzz=FuzzXxx --use-libafl --focus-on-new-code=false --libafl-config=libafl.jsonc
 ```
 
 `golibafl` also needs a TCP broker port for LibAFL's internal event manager. By default, it picks a **random free port** (instead of always `1337`). If you need a fixed port, set `GOLIBAFL_BROKER_PORT=1337` (or pass `-p/--port 1337` when running `golibafl` directly).
@@ -63,6 +78,8 @@ A ready-to-edit template lives at `misc/cybergo/libafl.config.jsonc`.
 
 If `golibafl` fails to launch, set `CYBERGO_VERBOSE_AFL=1` to print extra diagnostics and write them to `OUTPUT_DIR/golibafl_launcher_failure_<pid>.txt`.
 
+If fuzzing prints repeated timeouts with **0 executions** or appears stuck during startup, make sure you are using a LibAFL fork/build that runs the restarting manager in **non-fork (re-exec) mode**. The embedded Go runtime is not fork-safe once initialized, so forking-based restarts can deadlock and look like “exec/sec: 0.000”.
+
 ## Quick start
 
 1) Build the forked toolchain:
@@ -76,7 +93,7 @@ cd src
 
 ```bash
 cd test/cybergo/examples/reverse
-CGO_ENABLED=1 ../../../../bin/go test -fuzz=FuzzReverse --use-libafl
+CGO_ENABLED=1 ../../../../bin/go test -fuzz=FuzzReverse --use-libafl --focus-on-new-code=false
 ```
 
 Fuzzing runs until you stop it (Ctrl+C). The run prints `ok ...` on clean shutdown.
@@ -151,6 +168,7 @@ On each run, cybergo prepares `<...>/input/` as the initial `-i` corpus director
 
 - files from `testdata/fuzz/` (if it exists) are copied into it
 - manual seeds provided via `f.Add(...)` are written into it automatically
+- if this fuzzing campaign was already run before, the previous LibAFL `queue/` corpus is automatically reused on restart (so Ctrl-C + rerun continues from the same corpus by default)
 
 If the chosen `-i` directory is empty, `golibafl` generates a small random initial corpus.
 
@@ -188,3 +206,4 @@ f.Fuzz(func(t *testing.T, in MyStruct, data []byte, n int) { ... })
 - `--use-libafl` is intended only for `go test -fuzz=...`.
   It errors if you pass it without `-fuzz`.
 - The toolchain adds the `libfuzzer` build tag during compilation in this mode, enabling Go’s `-d=libfuzzer` instrumentation path for coverage/cmp tracing.
+- On Unix, `golibafl` uses LibAFL’s restarting manager in **non-fork (re-exec) mode** for reliability with the embedded Go runtime. This is also why `golibafl` switches its working directory to `OUTPUT_DIR/workdir/<pid>` (so respawns don’t fail if the original cwd is deleted/unlinked).
