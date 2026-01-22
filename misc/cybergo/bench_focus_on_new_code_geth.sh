@@ -9,6 +9,28 @@ Usage: bench_focus_on_new_code_geth.sh [--trials N] [--warmup SECONDS] [--timeou
 
 Benchmarks cybergo's --focus-on-new-code=true on a shallow clone of go-ethereum (geth).
 
+This simulates a "new bug in a big repo":
+  - It makes geth look "old" to git by committing the whole repo with an old
+    timestamp.
+  - Then it adds one new commit with a single crashing line (marked RECENT_BUG).
+  - The fuzzer's job is to find an input that hits that crash.
+
+It runs two modes and compares time-to-first-crash:
+  - baseline: normal fuzzing (no "new code" bias)
+  - git-aware: --focus-on-new-code=true, which uses git history to treat lines
+    from the recent commit as "new" and prioritize inputs that reach them.
+
+The "harness" is the compiled Go fuzz test turned into a native library
+(`libharness.a`). The `golibafl` binary is the LibAFL runner that links that
+library and performs fuzzing.
+
+To keep the comparison fair and stable, the script does a short warmup run
+before introducing the crash to build an initial corpus, then filters that
+corpus to remove any inputs that already crash. It also precomputes a git
+"recency map" once (so it doesn't have to re-scan git history in every trial),
+then runs N paired trials (baseline vs git-aware) with the same seeds and reports
+the median time-to-first-crash (capped at the timeout).
+
 Workflow:
   1) clone geth to /tmp
   2) add a fuzz target in package rlp (committed with an old date)
