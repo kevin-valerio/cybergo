@@ -12,10 +12,9 @@ lto = "fat"
 anyhow = "1.0.100"
 
 [dependencies]
-# TODO: Switch back to upstream LibAFL once git-aware scheduling is upstreamed.
-libafl = { path = "/home/kevinv/LibAFL-history-aware/crates/libafl", features = ["prelude", "std", "derive", "tui_monitor"] }
-libafl_bolts = { path = "/home/kevinv/LibAFL-history-aware/crates/libafl_bolts" }
-libafl_targets = { path = "/home/kevinv/LibAFL-history-aware/crates/libafl_targets", features = ["sancov_8bit", "observers", "libfuzzer", "sancov_cmplog", "sancov_pcguard_hitcounts"] }
+libafl = { git = "https://github.com/kevin-valerio/LibAFL-git-aware", branch = "cybergo-libafl-gitaware", features = ["prelude", "std", "derive", "tui_monitor"] }
+libafl_bolts = { git = "https://github.com/kevin-valerio/LibAFL-git-aware", branch = "cybergo-libafl-gitaware" }
+libafl_targets = { git = "https://github.com/kevin-valerio/LibAFL-git-aware", branch = "cybergo-libafl-gitaware", features = ["sancov_8bit", "observers", "libfuzzer", "sancov_cmplog", "sancov_pcguard_hitcounts"] }
 clap = {version = "4.5.23", features = ["derive"]}
 mimalloc = "0.1.43"
 serde = { version = "1", features = ["derive"] }
