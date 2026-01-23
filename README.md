@@ -2,7 +2,9 @@
 
 [![integration tests](https://github.com/kevin-valerio/cybergo/actions/workflows/go.yml/badge.svg?branch=master)](https://github.com/kevin-valerio/cybergo/actions/workflows/go.yml)
 
-cybergo is a security-focused fork of the Go toolchain. In a _very_ simple phrasing, cybergo is a copy of the Go compiler that finds bugs. For now, it focuses on four things:
+cybergo is a security-focused fork of the Go toolchain. In a _very_ simple phrasing, cybergo is a copy of the Go compiler that finds bugs. If you are a security researcher auditing Go codebases, you should probably use this tool.
+
+For now, it focuses on four things:
 
 - Integrating [go-panikint](https://github.com/trailofbits/go-panikint): instrumentation that panics on **integer overflow/underflow** (and **optionally on truncating integer conversions**).
 - Integrating [LibAFL](https://github.com/AFLplusplus/LibAFL) fuzzer: run Go fuzzing harnesses with **LibAFL** for better fuzzing performances.
@@ -10,7 +12,7 @@ cybergo is a security-focused fork of the Go toolchain. In a _very_ simple phras
 - Git-blame-oriented fuzzing (based on [this work](https://github.com/kevin-valerio/LibAFL-git-aware)): when fuzzing with LibAFL mode, you can orientate the fuzzer towards **recently added/edited lines**.
 
 It especially has **two** objectives:
-- Being easy to use and UX-friendly (we're tired of complex tools),
+- Being easy to use and UX-friendly (_we're tired of complex tools_),
 - Helping to find bugs in Go codebases via built-in security implementations.
 
 ## Table of Contents
