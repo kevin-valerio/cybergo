@@ -2,7 +2,7 @@
 
 [![integration tests](https://github.com/kevin-valerio/cybergo/actions/workflows/go.yml/badge.svg?branch=master)](https://github.com/kevin-valerio/cybergo/actions/workflows/go.yml)
 
-cybergo is a security-focused fork of the Go toolchain. In a _very_ simple phrasing, cybergo is a copy of the Go compiler that finds bugs. If you are a security researcher auditing Go codebases, you should probably use this tool.
+cybergo is a security-focused fork of the Go toolchain. In a _very_ simple phrasing, it's copy of the Go compiler that finds bugs. If you are a security researcher auditing Go codebases, you should probably use this tool and consider it as a great swiss-knife.
 
 For now, it focuses on four things:
 
