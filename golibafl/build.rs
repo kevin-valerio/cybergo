@@ -29,6 +29,14 @@ where
 }
 
 fn main() -> Result<()> {
+    // Export `__sanitizer_cov_*` symbols from the main executable so that
+    // SanitizerCoverage-instrumented shared libraries (e.g. yourtarget.so)
+    // can resolve and register their counters into libafl_targets::COUNTERS_MAPS.
+    #[cfg(target_os = "linux")]
+    {
+        println!("cargo:rustc-link-arg=-Wl,--export-dynamic");
+    }
+
     // The harness is produced by `go build -buildmode=c-archive`.
     // On macOS, the Go stdlib (e.g., crypto/x509) may rely on system frameworks.
     #[cfg(target_os = "macos")]

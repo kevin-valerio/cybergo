@@ -35,7 +35,7 @@ use libafl_targets::{
     CmpLogObserver, COUNTERS_MAPS,
 };
 use mimalloc::MiMalloc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::panic;
 use std::{
     collections::{HashMap, HashSet},
@@ -45,7 +45,11 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
+};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc, Arc,
 };
 
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind};
@@ -409,12 +413,66 @@ fn head_time_epoch_seconds(repo_root: &Path) -> u64 {
     })
 }
 
-fn read_mapping_head_time(path: &Path) -> Option<u64> {
-    let bytes = fs::read(path).ok()?;
-    if bytes.len() < 8 {
-        return None;
+fn read_mapping_header(path: &Path) -> Option<(u64, u64)> {
+    let mut f = fs::File::open(path).ok()?;
+    let mut header = [0u8; 16];
+    f.read_exact(&mut header).ok()?;
+    let head_time = u64::from_le_bytes(header[0..8].try_into().unwrap());
+    let len = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    Some((head_time, len))
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct GitRecencyMapSidecar {
+    version: u32,
+    go_o_hash_fnv1a64: u64,
+    counters_len: u64,
+}
+
+fn git_recency_map_sidecar_path(mapping_path: &Path) -> PathBuf {
+    mapping_path.with_extension("bin.meta.json")
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 14695981039346656037;
+    const PRIME: u64 = 1099511628211;
+    let mut hash = OFFSET;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(PRIME);
     }
-    Some(u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
+    hash
+}
+
+fn read_git_recency_map_sidecar(path: &Path) -> Option<GitRecencyMapSidecar> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!(
+                "golibafl: failed to create directory {}: {err}",
+                parent.display()
+            );
+            std::process::exit(2);
+        }
+    }
+
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&tmp, bytes).unwrap_or_else(|err| {
+        eprintln!("golibafl: failed to write {}: {err}", tmp.display());
+        std::process::exit(2);
+    });
+    fs::rename(&tmp, path).unwrap_or_else(|err| {
+        eprintln!(
+            "golibafl: failed to rename {} to {}: {err}",
+            tmp.display(),
+            path.display()
+        );
+        std::process::exit(2);
+    });
 }
 
 fn is_header_line(line: &str) -> bool {
@@ -573,6 +631,37 @@ fn go_tool_locations(obj_path: &Path, addrs: &[u64]) -> HashMap<u64, (String, u3
     drop(stdin);
 
     // `go tool addr2line` writes output only after stdin is closed.
+    let total = addrs.len();
+    let processed_counter = Arc::new(AtomicUsize::new(0));
+    let heartbeat = if total > 10_000 {
+        let processed_counter = Arc::clone(&processed_counter);
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut last = 0usize;
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(15)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let cur = processed_counter.load(Ordering::Relaxed);
+                        if cur == last {
+                            eprintln!(
+                                "golibafl: addr2line still running ({cur}/{total}); elapsed {}s",
+                                started.elapsed().as_secs()
+                            );
+                        }
+                        last = cur;
+                    }
+                }
+            }
+        });
+        Some((stop_tx, handle))
+    } else {
+        None
+    };
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut processed = 0usize;
     for addr in addrs {
         // Expect 2 lines per address:
         //  - "function"
@@ -588,18 +677,35 @@ fn go_tool_locations(obj_path: &Path, addrs: &[u64]) -> HashMap<u64, (String, u3
         if n == 0 {
             break;
         }
+        processed += 1;
+        processed_counter.store(processed, Ordering::Relaxed);
 
         let loc_tok = loc_line.split_whitespace().next().unwrap_or("");
-        let Some((file, line)) = loc_tok.rsplit_once(':') else {
-            continue;
-        };
-        let Ok(line) = line.parse::<u32>() else {
-            continue;
-        };
-        if file == "??" || line == 0 {
-            continue;
+        if let Some((file, line)) = loc_tok.rsplit_once(':') {
+            if let Ok(line) = line.parse::<u32>() {
+                if file != "??" && line != 0 {
+                    res.insert(*addr, (file.to_string(), line));
+                }
+            }
         }
-        res.insert(*addr, (file.to_string(), line));
+
+        let done = processed;
+        if total > 10_000
+            && (last_progress.elapsed() >= Duration::from_secs(10) || done == total)
+        {
+            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+            let pct = (done as f64) * 100.0 / (total as f64);
+            let rate = (done as f64) / elapsed;
+            eprintln!(
+                "golibafl: addr2line progress {done}/{total} ({pct:.1}%), {rate:.0} addr/s"
+            );
+            last_progress = Instant::now();
+        }
+    }
+
+    if let Some((stop_tx, handle)) = heartbeat {
+        let _ = stop_tx.send(());
+        let _ = handle.join();
     }
 
     let status = child.wait().unwrap_or_else(|err| {
@@ -666,27 +772,19 @@ fn ensure_git_recency_mapping(mapping_path: &Path, target_dir: &Path) {
     });
     let head_time = head_time_epoch_seconds(&repo_root);
 
-    if read_mapping_head_time(mapping_path) == Some(head_time) {
-        return;
-    }
-
     let harness_lib = env::var_os("HARNESS_LIB").unwrap_or_else(|| {
         eprintln!("golibafl: HARNESS_LIB must be set when {GOLIBAFL_FOCUS_ON_NEW_CODE_ENV}=true");
         std::process::exit(2);
     });
     let harness_lib = PathBuf::from(harness_lib);
     let go_o_bytes = extract_go_o_from_harness(&harness_lib);
+    let go_o_hash = fnv1a64(&go_o_bytes);
 
     let obj = object::File::parse(&*go_o_bytes).unwrap_or_else(|err| {
         eprintln!(
             "golibafl: failed to parse go.o from {}: {err}",
             harness_lib.display()
         );
-        std::process::exit(2);
-    });
-    let tmp_go_o = env::temp_dir().join(format!("golibafl_gitrec_go_{}.o", std::process::id()));
-    fs::write(&tmp_go_o, &go_o_bytes).unwrap_or_else(|err| {
-        eprintln!("golibafl: failed to write {}: {err}", tmp_go_o.display());
         std::process::exit(2);
     });
 
@@ -698,6 +796,75 @@ fn ensure_git_recency_mapping(mapping_path: &Path, target_dir: &Path) {
     });
     let counters_len = usize::try_from(counters_section.size()).unwrap_or_else(|_| {
         eprintln!("golibafl: .go.fuzzcntrs is too large");
+        std::process::exit(2);
+    });
+
+    let existing = read_mapping_header(mapping_path).and_then(|(old_head_time, old_len)| {
+        let expected_size = 16u64.checked_add(old_len.checked_mul(8)?)?;
+        let actual_size = fs::metadata(mapping_path).ok()?.len();
+        if expected_size != actual_size {
+            return None;
+        }
+        let old_len = usize::try_from(old_len).ok()?;
+        Some((old_head_time, old_len))
+    });
+
+    let sidecar_path = git_recency_map_sidecar_path(mapping_path);
+    let sidecar = read_git_recency_map_sidecar(&sidecar_path);
+    let sidecar_matches = match sidecar.as_ref() {
+        Some(meta) => {
+            meta.version == 1
+                && meta.go_o_hash_fnv1a64 == go_o_hash
+                && meta.counters_len == counters_len as u64
+        }
+        None => false,
+    };
+
+    if let Some((old_head_time, old_len)) = existing {
+        if old_len == counters_len && (sidecar_matches || sidecar.is_none()) {
+            if sidecar.is_none() {
+                let meta = GitRecencyMapSidecar {
+                    version: 1,
+                    go_o_hash_fnv1a64: go_o_hash,
+                    counters_len: counters_len as u64,
+                };
+                let bytes = serde_json::to_vec(&meta).unwrap_or_else(|err| {
+                    eprintln!("golibafl: failed to serialize git recency sidecar: {err}");
+                    std::process::exit(2);
+                });
+                write_atomic_bytes(&sidecar_path, &bytes);
+            }
+
+            if old_head_time != head_time {
+                eprintln!("golibafl: updating git recency map head_time (reusing existing mapping)");
+                let mut out = fs::OpenOptions::new()
+                    .write(true)
+                    .open(mapping_path)
+                    .unwrap_or_else(|err| {
+                        eprintln!(
+                            "golibafl: failed to open mapping file {}: {err}",
+                            mapping_path.display()
+                        );
+                        std::process::exit(2);
+                    });
+                out.write_all(&head_time.to_le_bytes())
+                    .unwrap_or_else(|err| {
+                        eprintln!("golibafl: failed to update mapping file: {err}");
+                        std::process::exit(2);
+                    });
+            }
+
+            return;
+        }
+    }
+
+    eprintln!(
+        "golibafl: generating git recency mapping ({} counters); this may take a while",
+        counters_len
+    );
+    let tmp_go_o = env::temp_dir().join(format!("golibafl_gitrec_go_{}.o", std::process::id()));
+    fs::write(&tmp_go_o, &go_o_bytes).unwrap_or_else(|err| {
+        eprintln!("golibafl: failed to write {}: {err}", tmp_go_o.display());
         std::process::exit(2);
     });
 
@@ -735,6 +902,7 @@ fn ensure_git_recency_mapping(mapping_path: &Path, target_dir: &Path) {
         let mut addrs: Vec<u64> = counter_addrs.values().copied().collect();
         addrs.sort_unstable();
         addrs.dedup();
+        eprintln!("golibafl: running go tool addr2line on {} addresses", addrs.len());
         let locs = go_tool_locations(&tmp_go_o, &addrs);
         for (idx, addr) in counter_addrs {
             let Some((file, line)) = locs.get(&addr).cloned() else {
@@ -759,7 +927,26 @@ fn ensure_git_recency_mapping(mapping_path: &Path, target_dir: &Path) {
     }
 
     let mut times_by_file: HashMap<String, HashMap<u32, u64>> = HashMap::new();
+    let total_files = needed_by_file.len();
+    if total_files > 0 {
+        eprintln!("golibafl: running git blame on {total_files} file(s)");
+    }
+    let started_blame = Instant::now();
+    let mut last_blame_progress = Instant::now();
+    let mut blamed_files = 0usize;
     for (file, needed_lines) in &needed_by_file {
+        blamed_files += 1;
+        if total_files > 50
+            && (last_blame_progress.elapsed() >= Duration::from_secs(10)
+                || blamed_files == total_files)
+        {
+            let elapsed = started_blame.elapsed().as_secs_f64().max(0.001);
+            let pct = (blamed_files as f64) * 100.0 / (total_files as f64);
+            eprintln!(
+                "golibafl: git blame progress {blamed_files}/{total_files} ({pct:.1}%), elapsed {elapsed:.0}s"
+            );
+            last_blame_progress = Instant::now();
+        }
         let times = blame_times_for_lines(&repo_root, file, needed_lines);
         times_by_file.insert(file.clone(), times);
     }
@@ -783,10 +970,12 @@ fn ensure_git_recency_mapping(mapping_path: &Path, target_dir: &Path) {
         }
     }
 
-    let mut out = fs::File::create(mapping_path).unwrap_or_else(|err| {
+    let tmp_mapping_path =
+        mapping_path.with_extension(format!("bin.tmp-{}", std::process::id()));
+    let mut out = fs::File::create(&tmp_mapping_path).unwrap_or_else(|err| {
         eprintln!(
             "golibafl: failed to create mapping file {}: {err}",
-            mapping_path.display()
+            tmp_mapping_path.display()
         );
         std::process::exit(2);
     });
@@ -807,6 +996,27 @@ fn ensure_git_recency_mapping(mapping_path: &Path, target_dir: &Path) {
             std::process::exit(2);
         });
     }
+    drop(out);
+
+    fs::rename(&tmp_mapping_path, mapping_path).unwrap_or_else(|err| {
+        eprintln!(
+            "golibafl: failed to rename {} to {}: {err}",
+            tmp_mapping_path.display(),
+            mapping_path.display()
+        );
+        std::process::exit(2);
+    });
+
+    let meta = GitRecencyMapSidecar {
+        version: 1,
+        go_o_hash_fnv1a64: go_o_hash,
+        counters_len: counters_len as u64,
+    };
+    let meta_bytes = serde_json::to_vec(&meta).unwrap_or_else(|err| {
+        eprintln!("golibafl: failed to serialize git recency sidecar: {err}");
+        std::process::exit(2);
+    });
+    write_atomic_bytes(&sidecar_path, &meta_bytes);
 }
 
 // Command line arguments with clap

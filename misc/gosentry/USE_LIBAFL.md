@@ -22,6 +22,12 @@ When `--use-libafl` is set, `--focus-on-new-code={true|false}` is **required**.
 
 Note: `--focus-on-new-code=true` needs `git` (to run `git blame`) and `go tool addr2line` to map coverage counters back to source `file:line`.
 
+`golibafl` stores the generated mapping file under the LibAFL output directory as `git_recency_map.bin` (path provided to the runner via `LIBAFL_GIT_RECENCY_MAPPING_PATH`).
+On large targets, generating this file can take several minutes because it needs to run `go tool addr2line` and `git blame` for many coverage counters.
+
+To avoid regenerating the full mapping on commits that don't change the Go harness object (`go.o`), `golibafl` writes a small sidecar file next to it: `git_recency_map.bin.meta.json`.
+If the sidecar indicates the current `go.o` hash matches, `golibafl` will reuse the existing mapping entries and only update the `head_time` header in `git_recency_map.bin`.
+
 Implementation note: the git-aware scheduler currently comes from a local LibAFL fork (TODO: switch back to upstream LibAFL once upstreamed).
 
 ### Benchmark (geth)
