@@ -103,6 +103,8 @@ If `golibafl` fails to launch, set `GOSENTRY_VERBOSE_AFL=1` to print extra diagn
 
 If fuzzing prints repeated timeouts with **0 executions** or appears stuck during startup, make sure you are using a LibAFL fork/build that runs the restarting manager in **non-fork (re-exec) mode**. The embedded Go runtime is not fork-safe once initialized, so forking-based restarts can deadlock and look like “exec/sec: 0.000”.
 
+If you see a panic like `BUG: The current message never got committed using send!` (from `crates/ll_mp/...`) while stopping a fuzz run, it is a `golibafl`/LibAFL shutdown issue (not a Go harness bug). Rebuild/update `golibafl` and retry; clean shutdown should print `Fuzzing stopped by user. Good bye.` and `go test` should end with `ok ...`.
+
 ## Quick start
 
 1) Build the forked toolchain:

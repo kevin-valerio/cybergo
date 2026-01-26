@@ -1886,6 +1886,7 @@ fn fuzz(
                             restarting_mgr.maybe_report_progress(&mut state, monitor_timeout)
                         {
                             if matches!(err, Error::ShuttingDown) {
+                                let _ = restarting_mgr.send_exiting();
                                 notify_restarting_mgr_exit();
                             }
                             return Err(err);
@@ -1898,6 +1899,7 @@ fn fuzz(
                             &mut restarting_mgr,
                         ) {
                             if matches!(err, Error::ShuttingDown) {
+                                let _ = restarting_mgr.send_exiting();
                                 notify_restarting_mgr_exit();
                             }
                             return Err(err);
