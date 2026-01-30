@@ -1535,10 +1535,6 @@ func fixZeroSizedSymbols(ctxt *Link) {
 	types.SetSize(8)
 	ldr.SetAttrSpecial(types.Sym(), false)
 
-	etypedesc := ldr.CreateSymForUpdate("runtime.etypedesc", 0)
-	etypedesc.SetType(sym.STYPE)
-	ldr.SetAttrSpecial(etypedesc.Sym(), false)
-
 	etypes := ldr.CreateSymForUpdate("runtime.etypes", 0)
 	etypes.SetType(sym.STYPE)
 	ldr.SetAttrSpecial(etypes.Sym(), false)
@@ -2186,7 +2182,7 @@ func (state *dodataState) allocateDataSections(ctxt *Link) {
 	createRelroSect := func(name string, symn sym.SymKind) *sym.Section {
 		sect := state.allocateNamedDataSection(segRelro, genrelrosecname(name), []sym.SymKind{symn}, relroPerm)
 
-		if symn == sym.STYPE && ctxt.HeadType != objabi.Haix {
+		if symn == sym.STYPE {
 			// Skip forward so that no type
 			// reference uses a zero offset.
 			// This is unlikely but possible in small
@@ -2218,7 +2214,6 @@ func (state *dodataState) allocateDataSections(ctxt *Link) {
 
 	sect = createRelroSect(".go.type", sym.STYPE)
 	ldr.SetSymSect(ldr.LookupOrCreateSym("runtime.types", 0), sect)
-	ldr.SetSymSect(ldr.LookupOrCreateSym("runtime.etypedesc", 0), sect)
 	ldr.SetSymSect(ldr.LookupOrCreateSym("runtime.etypes", 0), sect)
 
 	sect = createRelroSect(".go.func", sym.SGOFUNC)
@@ -2400,6 +2395,9 @@ func (state *dodataState) dodataSect(ctxt *Link, symn sym.SymKind, syms []loader
 		// sorted by type string. The reflect package will use
 		// this to ensure that type descriptor pointers are unique.
 
+		// We define type:* for some links.
+		typeStar := ldr.Lookup("type:*", 0)
+
 		// Compute all the type strings we need once.
 		typelinkStrings := make(map[loader.Sym]string)
 		for _, s := range syms {
@@ -2414,6 +2412,14 @@ func (state *dodataState) dodataSect(ctxt *Link, symn sym.SymKind, syms []loader
 			// Sort head and tail regardless of typelink.
 			if ret, matched := sortHeadTail(si, sj); matched {
 				return ret
+			}
+			if typeStar != 0 {
+				// type:* comes first, after runtime.types
+				if si == typeStar {
+					return true
+				} else if sj == typeStar {
+					return false
+				}
 			}
 
 			iTypestr, iIsTypelink := typelinkStrings[si]
@@ -2437,20 +2443,30 @@ func (state *dodataState) dodataSect(ctxt *Link, symn sym.SymKind, syms []loader
 		})
 
 		// Find the end of the typelink descriptors.
-		// The offset starts at 1 to match the increment in
+		// The size starts at 1 to match the increment in
 		// createRelroSect in allocateDataSections.
 		// TODO: This wastes some space.
-		offset := int64(1)
+		typeLinkSize := int64(1)
 		for i := range sl {
 			si := sl[i].sym
+			if si == head || si == typeStar {
+				continue
+			}
 			if _, isTypelink := typelinkStrings[si]; !isTypelink {
 				break
 			}
-			offset = Rnd(offset, int64(symalign(ldr, si)))
-			offset += sl[i].sz
+			typeLinkSize = Rnd(typeLinkSize, int64(symalign(ldr, si)))
+			typeLinkSize += sl[i].sz
 		}
 
-		ldr.SetSymValue(ldr.LookupOrCreateSym("runtime.etypedesc", 0), offset)
+		// Store the length of the typelink descriptors
+		// in the typedesclen field of moduledata.
+		if ctxt.moduledataTypeDescOffset == 0 {
+			Errorf("internal error: phase error: moduledataTypeDescOffset not set in dodataSect")
+		} else {
+			su := ldr.MakeSymbolUpdater(ctxt.Moduledata)
+			su.SetUint(ctxt.Arch, ctxt.moduledataTypeDescOffset, uint64(typeLinkSize))
+		}
 
 	default:
 		sort.Slice(sl, sortFn)
@@ -3098,12 +3114,9 @@ func (ctxt *Link) address() []*sym.Segment {
 	ctxt.xdefine("runtime.rodata", sym.SRODATA, int64(rodata.Vaddr))
 	ctxt.xdefine("runtime.erodata", sym.SRODATA, int64(rodata.Vaddr+rodata.Length))
 	ctxt.xdefine("runtime.types", sym.SRODATA, int64(types.Vaddr))
-	// etypedesc was set to the offset from the symbol start in dodataSect.
-	s := ldr.Lookup("runtime.etypedesc", 0)
-	ctxt.xdefine("runtime.etypedesc", sym.SRODATA, int64(types.Vaddr+uint64(ldr.SymValue(s))))
 	ctxt.xdefine("runtime.etypes", sym.SRODATA, int64(types.Vaddr+types.Length))
 
-	s = ldr.Lookup("runtime.gcdata", 0)
+	s := ldr.Lookup("runtime.gcdata", 0)
 	ldr.SetAttrLocal(s, true)
 	ctxt.xdefine("runtime.egcdata", sym.SRODATA, ldr.SymAddr(s)+ldr.SymSize(s))
 	ldr.SetSymSect(ldr.LookupOrCreateSym("runtime.egcdata", 0), ldr.SymSect(s))
